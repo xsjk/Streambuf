@@ -1,18 +1,20 @@
 #pragma once
 
 #include <mutex>
-#include <atomic>
+#include <boost/asio.hpp>
 #include <ranges>
 #include <list>
+
+using namespace std::chrono_literals;
 
 #define def constexpr auto 
 
 /**
  * @brief A interface that adds some functionalities to a view.
- * @note `cbegin()`, `cend()` `rbegin()`, `rend()`, `crbegin()`, `crend()` 
- *       `size()`, `empty()`, `front()`, `back()`, `operator[]`, `operator bool()` 
+ * @note `cbegin()`, `cend()` `rbegin()`, `rend()`, `crbegin()`, `crend()`
+ *       `size()`, `empty()`, `front()`, `back()`, `operator[]`, `operator bool()`
  * will be defined if possible.
- * @note You have to define `begin()` and `end()` in the derived class. 
+ * @note You have to define `begin()` and `end()` in the derived class.
  * @tparam D the derived class
  */
 template<class D>
@@ -77,7 +79,7 @@ class StreamBuffer : public view_interface<StreamBuffer<T, N, S>> {
         size_t &max_after;
         std::list<size_t> nodes {};
         std::mutex mutex {};
-        
+
         struct owning_view : view_interface<owning_view> {
             using value_type = T;
             def begin() const noexcept -> normal_iterator<T>;
@@ -86,7 +88,7 @@ class StreamBuffer : public view_interface<StreamBuffer<T, N, S>> {
             owning_view(owning_view &&other) { swap(other); }
             owning_view &operator=(const owning_view &) = delete;
             owning_view &operator=(owning_view &&other) { swap(other); return *this; }
-            owning_view(BorrowManager *manager, size_t n) : manager{manager} {
+            owning_view(BorrowManager *manager, size_t n) : manager { manager } {
                 std::lock_guard lock(manager->mutex);
                 size_t before = manager->before;
                 size_t after = manager->after;
@@ -125,7 +127,7 @@ class StreamBuffer : public view_interface<StreamBuffer<T, N, S>> {
             std::list<size_t>::iterator it;
         };
 
-        def lend(size_t n) { return owning_view (this, n); }
+        def lend(size_t n) { return owning_view(this, n); }
     };
     BorrowManager<0> read_manager { *this, before_start, start, stop };
     BorrowManager<1> write_manager { *this, stop, after_stop, before_start };
@@ -138,24 +140,27 @@ public:
     using const_iterator = normal_iterator<const T>;
     using reverse_iterator = std::reverse_iterator<iterator>;
     using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+    using read_view = typename decltype(read_manager)::owning_view;
+    using write_view = typename decltype(write_manager)::owning_view;
 
     template<typename ...Args> requires requires { S { std::declval<Args>()... }; }
-    StreamBuffer(Args &&...args) noexcept : storage { std::forward<Args>(args)... } {}
-    StreamBuffer(const StreamBuffer<T, N, S> &other) noexcept : storage { other.storage }, start { other.start.load() }, stop { other.stop.load() } {}
+    StreamBuffer(Args &&...args) noexcept : storage { std::forward<Args>(args)... } { }
+    StreamBuffer(const StreamBuffer<T, N, S> &other) noexcept : storage { other.storage }, start { other.start.load() }, stop { other.stop.load() } { }
     StreamBuffer(StreamBuffer<T, N, S> &&other) noexcept { swap(other); }
     def &operator=(const StreamBuffer<T, N, S> &other) noexcept { StreamBuffer<T, N, S>(other).swap(*this); return *this; }
     def &operator=(StreamBuffer<T, N, S> &&other) noexcept { swap(other); return *this; }
 
     def begin(this auto &&self) noexcept { return self.make_iterator(self.start); }
     def end(this auto &&self) noexcept { return self.make_iterator(self.stop); }
-    def clear() noexcept { 
+    def clear() noexcept {
         std::lock_guard read_lock(read_manager.mutex);
         std::lock_guard write_lock(write_manager.mutex);
-        before_start = start = stop = after_stop = 0; 
+        before_start = start = stop = after_stop = 0;
     }
     def size() const noexcept { return get_distance(start, stop); }
     def max_size() const noexcept { return N - 1; }
-    def full() const noexcept { return (after_stop + 1) % N == before_start; }
+    def full() const noexcept { return (stop + 1) % N == start; }
+    def empty() const noexcept { return start == stop; }
     def &at(this auto &&self, size_t index) { self.check_index(index); return self[index]; }
 
     def swap(StreamBuffer<T, N> &other) noexcept {
@@ -170,27 +175,48 @@ public:
         std::swap(after_stop, other.after_stop);
     }
 
-    def prepare(size_t n) { return write_manager.lend(n); }
-    def read(size_t n) { return read_manager.lend(n); }
-    def read() { return read_manager.lend(size()); }
+    def prepare(size_t n) -> write_view { return write_manager.lend(n); }
+    def read(size_t n) -> read_view { return read_manager.lend(n); }
+    def read() -> read_view { return read_manager.lend(size()); }
+
+    boost::asio::awaitable<write_view> async_prepare(size_t n) {
+        while (true) {
+            try { co_return prepare(n); }
+            catch (std::out_of_range &) { }
+            co_await async_sleep(0ms);
+        }
+    }
+
+    boost::asio::awaitable<read_view> async_read(auto &&...args) {
+        while (true) {
+            try { co_return read(std::forward<decltype(args)>(args)...); }
+            catch (std::out_of_range &) { }
+            co_await async_sleep(0ms);
+        }
+    }
 
     operator std::string(this auto &&self) noexcept { return std::format("StreamBuffer {{ start = {}, stop = {}, size = {} }}", self.start, self.stop, self.size()); }
     friend auto &operator<<(auto &os, const StreamBuffer<T, N> &buf) { return os << std::string(buf); }
 
 private:
+
+    static boost::asio::awaitable<void> async_sleep(auto time) {
+        co_await boost::asio::steady_timer(co_await boost::asio::this_coro::executor, time).async_wait(boost::asio::use_awaitable);
+    }
+
     void check_index(this auto &&self, size_t index) { if (index >= self.size()) throw std::out_of_range("index out of range"); }
 
 };
 
 template<typename T, size_t N, class S>
 template<size_t R>
-def StreamBuffer<T, N, S>::BorrowManager<R>::owning_view::begin() const noexcept -> StreamBuffer<T, N, S>::iterator { 
+def StreamBuffer<T, N, S>::BorrowManager<R>::owning_view::begin() const noexcept -> StreamBuffer<T, N, S>::iterator {
     return manager->buffer.make_iterator(start);
 }
 
 template<typename T, size_t N, class S>
 template<size_t R>
-def StreamBuffer<T, N, S>::BorrowManager<R>::owning_view::end() const noexcept -> StreamBuffer<T, N, S>::iterator { 
+def StreamBuffer<T, N, S>::BorrowManager<R>::owning_view::end() const noexcept -> StreamBuffer<T, N, S>::iterator {
     return manager->buffer.make_iterator(stop);
 }
 
