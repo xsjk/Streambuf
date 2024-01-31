@@ -52,6 +52,14 @@ awaitable<void> async_main() {
     );
     assert(rb.size() == 3);
     std::cout << std::endl;
+
+    {
+        const auto crb = rb;
+        rb = crb;
+        auto rb2 = rb;
+        rb2 = std::move(rb);
+        rb = std::move(rb2);
+    }
     
     co_await (
         write(rb, 10, [](auto i) { return i * i; },     "(1)") &&
@@ -63,6 +71,8 @@ awaitable<void> async_main() {
     std::cout << std::endl;
 
     print(rb);
+    print(co_await rb.async_read());
+    assert(rb.empty());
 
     co_return;
 }
