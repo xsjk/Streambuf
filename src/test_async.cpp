@@ -71,7 +71,7 @@ awaitable<void> async_main() {
     std::cout << std::endl;
 
     print(rb);
-    print(co_await rb.async_read());
+    print(rb.read());
     assert(rb.empty());
 
     co_return;
