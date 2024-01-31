@@ -360,11 +360,10 @@ public:
      * @param n the size to read
      * @return a view for reading
      * @note This function will asynchronously wait until enough data is available.
-     * @note If no argument is provided, this function will read all available data immediately.
      */
-    boost::asio::awaitable<read_view> async_read(auto &&...args) noexcept {
+    boost::asio::awaitable<read_view> async_read(size_t n) noexcept {
         while (true) {
-            try { co_return read(std::forward<decltype(args)>(args)...); }
+            try { co_return read(n); }
             catch (std::out_of_range &) { }
             co_await async_sleep(0ms);
         }
